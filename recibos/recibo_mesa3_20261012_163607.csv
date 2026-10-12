@@ -1,0 +1,11 @@
+﻿Food Zone Restaurante
+Recibo,120001
+Mesa,3
+Fecha,2026-10-12 16:36:07
+
+Producto,Cantidad,Precio unitario (C$),Subtotal (C$)
+"Alitas Extra Picante",2,150.00,300.00
+"Alitas Pequeñas",2,100.00,200.00
+"Pastel",2,80.00,160.00
+"Arroz de leche",2,30.00,60.00
+TOTAL,,,720.00

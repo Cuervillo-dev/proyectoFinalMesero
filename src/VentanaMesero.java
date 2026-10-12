@@ -14,6 +14,9 @@ public class VentanaMesero extends JFrame {
 
     private final java.util.Set<Integer> mesasYaAvisadas = new java.util.HashSet<>();
     private final JPanel panelMesas = new JPanel(new GridLayout(1, 0, 12, 12));
+    private final JTabbedPane tabs = new JTabbedPane();
+    private PanelAdmin panelAdmin;
+    private boolean adminAutenticado = false;
 
     private final JTable tablaPedidos = new JTable();
     private final DefaultTableModel modeloPedidos =
@@ -30,7 +33,7 @@ public class VentanaMesero extends JFrame {
     public VentanaMesero() {
         super("Food Zone - Atención Mesero");
         setDefaultCloseOperation(EXIT_ON_CLOSE);
-        setSize(800, 280);
+        setSize(900, 380);
         setLocationRelativeTo(null);
 
         panelMesas.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
@@ -55,9 +58,26 @@ public class VentanaMesero extends JFrame {
         panelPedidos.add(split, BorderLayout.CENTER);
         panelPedidos.add(btnEntregado, BorderLayout.SOUTH);
 
-        JTabbedPane tabs = new JTabbedPane();
+        panelAdmin = new PanelAdmin(this, this::cerrarSesionAdmin);
         tabs.addTab("Mesas", panelMesas);
         tabs.addTab("Pedidos", panelPedidos);
+        tabs.addTab("Administración", panelAdmin);
+
+        // Al entrar a Administración pide login; al salir de la pestaña se cierra la sesión
+        tabs.addChangeListener(e -> {
+            if (tabs.getSelectedComponent() == panelAdmin) {
+                if (!adminAutenticado) {
+                    if (pedirLogin()) {
+                        adminAutenticado = true;
+                        panelAdmin.cargar();
+                    } else {
+                        tabs.setSelectedIndex(0);
+                    }
+                }
+            } else {
+                adminAutenticado = false;
+            }
+        });
 
         txtNotifPedidos.setEditable(false);
         txtNotifCuenta.setEditable(false);
@@ -79,7 +99,13 @@ public class VentanaMesero extends JFrame {
 
         add(panelNotif, BorderLayout.EAST);
         add(tabs, BorderLayout.CENTER);
-        add(btnRefrescar, BorderLayout.SOUTH);
+        JButton btnVentas = new JButton("Ventas del día");
+        btnVentas.addActionListener(e -> mostrarVentasDelDia());
+
+        JPanel panelSur = new JPanel(new GridLayout(1, 2, 4, 0));
+        panelSur.add(btnRefrescar);
+        panelSur.add(btnVentas);
+        add(panelSur, BorderLayout.SOUTH);
 
         cargarMesas();
         inicializarBaseline();
@@ -148,7 +174,7 @@ public class VentanaMesero extends JFrame {
     }
 
     private JPanel crearTarjeta(Mesa m) {
-        JPanel card = new JPanel(new GridLayout(4, 1, 4, 4));
+        JPanel card = new JPanel(new GridLayout(5, 1, 4, 4));
         card.setBorder(BorderFactory.createLineBorder(Color.GRAY));
 
         JLabel lblMesa = new JLabel("Mesa " + m.getNumero(), SwingConstants.CENTER);
@@ -170,32 +196,169 @@ public class VentanaMesero extends JFrame {
             cargarMesas();
         });
 
+        JButton btnRecibo = new JButton("Recibo");
+        btnRecibo.setEnabled(!m.isLibre());         // solo si está ocupada
+        btnRecibo.addActionListener(e -> {
+            try {
+                java.nio.file.Path ruta = ReciboService.generarCsv(m.getNumero());
+                mostrarRecibo("Recibo guardado en:", ruta);
+            } catch (Exception ex) {
+                JOptionPane.showMessageDialog(this, ex.getMessage(),
+                        "No se pudo generar", JOptionPane.WARNING_MESSAGE);
+            }
+        });
+
         JButton btnLiberar = new JButton("Liberar");
         btnLiberar.setEnabled(!m.isLibre());        // solo si está ocupada
         btnLiberar.addActionListener(e -> {
-            int r = JOptionPane.showConfirmDialog(this,
-                    "¿Liberar la mesa " + m.getNumero() + "?\nSe cerrará su cuenta.",
-                    "Confirmar", JOptionPane.YES_NO_OPTION);
-            if (r != JOptionPane.YES_OPTION) return;
+            int numero = m.getNumero();
             try {
-                MesaDao.liberar(m.getNumero());
-                mesasYaAvisadas.remove(m.getNumero());   // solo al liberar de verdad
-            } catch (SQLException ex) {
-                mostrarError(ex);
+                Integer idPedido = PedidoDao.idPedidoActivoDeMesa(numero);
+                boolean faltaRecibo = idPedido != null && !ReciboService.yaImpreso(idPedido);
+
+                String pregunta = "¿Cerrar la cuenta y liberar la mesa " + numero + "?";
+                if (faltaRecibo) pregunta += "\nEl recibo aún no se ha impreso: se generará automáticamente.";
+                int resp = JOptionPane.showConfirmDialog(this, pregunta,
+                        "Liberar mesa", JOptionPane.YES_NO_OPTION);
+                if (resp != JOptionPane.YES_OPTION) return;
+
+                // 1) Recibo solo si falta (si falla, NO se cierra la cuenta)
+                java.nio.file.Path ruta = null;
+                if (faltaRecibo) ruta = ReciboService.generarCsv(numero);
+
+                // 2) Pedido -> PAGADO y mesa -> LIBRE (transacción)
+                PedidoDao.cerrarCuenta(numero);
+
+                // 3) Limpiar aviso de cuenta solicitada
+                mesasYaAvisadas.remove(numero);
+
+                // 4) Refrescar antes de mostrar el diálogo
+                cargarMesas();
+
+                if (ruta != null) {
+                    mostrarRecibo("Mesa liberada.\nRecibo generado automáticamente en:", ruta);
+                } else {
+                    JOptionPane.showMessageDialog(this, idPedido != null
+                            ? "Mesa liberada.\nEl recibo ya estaba impreso."
+                            : "Mesa liberada.");
+                }
+            } catch (Exception ex) {
+                JOptionPane.showMessageDialog(this,
+                        "No se pudo liberar la mesa " + numero + ":\n" + ex.getMessage(),
+                        "Error", JOptionPane.ERROR_MESSAGE);
             }
-            cargarMesas();
         });
 
         card.add(lblMesa);
         card.add(lblEstado);
         card.add(btnOcupar);
+        card.add(btnRecibo);
         card.add(btnLiberar);
         return card;
+    }
+
+    // El "día" de ventas va de INICIO_DIA a FIN_DIA (hora local)
+    private static final java.time.LocalTime INICIO_DIA = java.time.LocalTime.of(1, 0);
+    private static final java.time.LocalTime FIN_DIA = java.time.LocalTime.of(23, 0);
+
+    private void mostrarVentasDelDia() {
+        java.time.LocalDateTime ahora = java.time.LocalDateTime.now();
+        // Antes de la 1:00 a.m. todavía cuenta el día anterior
+        java.time.LocalDate dia = ahora.toLocalTime().isBefore(INICIO_DIA)
+                ? ahora.toLocalDate().minusDays(1) : ahora.toLocalDate();
+        java.time.LocalDateTime desde = dia.atTime(INICIO_DIA);
+        java.time.LocalDateTime hasta = dia.atTime(FIN_DIA);
+
+        try {
+            java.sql.Timestamp tDesde = java.sql.Timestamp.valueOf(desde);
+            java.sql.Timestamp tHasta = java.sql.Timestamp.valueOf(hasta);
+            double[] r = PedidoDao.resumenVentas(tDesde, tHasta);
+            List<String> productos = PedidoDao.productosVendidos(tDesde, tHasta);
+
+            java.time.format.DateTimeFormatter f = java.time.format.DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm");
+            StringBuilder sb = new StringBuilder();
+            sb.append("Del ").append(desde.format(f)).append("\nal ").append(hasta.format(f)).append("\n\n");
+            sb.append("Cuentas cerradas: ").append((int) r[0]).append("\n");
+            sb.append(String.format("Total vendido: C$%.2f%n", r[1]));
+            sb.append("\nProductos vendidos:\n");
+            if (productos.isEmpty()) sb.append("  (ninguno)\n");
+            for (String p : productos) sb.append("  ").append(p).append("\n");
+
+            JTextArea area = new JTextArea(sb.toString(), 14, 32);
+            area.setEditable(false);
+            String[] opciones = {"Guardar ventas en CSV", "Cerrar"};
+            int op = JOptionPane.showOptionDialog(this, new JScrollPane(area),
+                    "Ventas del día", JOptionPane.DEFAULT_OPTION, JOptionPane.INFORMATION_MESSAGE,
+                    null, opciones, opciones[1]);
+            if (op == 0) {
+                java.nio.file.Path ruta = VentasService.generarCsv(desde, hasta);
+                mostrarArchivo("Ventas del día", "Ventas guardadas en:", ruta, "Abrir archivo");
+            }
+        } catch (Exception ex) {
+            mostrarError(ex);
+        }
+    }
+
+    private boolean pedirLogin() {
+        JTextField txtUsuario = new JTextField(15);
+        JPasswordField txtPass = new JPasswordField(15);
+        JPanel form = new JPanel(new GridLayout(0, 1, 4, 4));
+        form.add(new JLabel("Usuario:"));
+        form.add(txtUsuario);
+        form.add(new JLabel("Contraseña:"));
+        form.add(txtPass);
+
+        int r = JOptionPane.showConfirmDialog(this, form, "Administración",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        if (r != JOptionPane.OK_OPTION) return false;
+        try {
+            if (UsuarioDao.validar(txtUsuario.getText().trim(), new String(txtPass.getPassword()))) {
+                return true;
+            }
+            JOptionPane.showMessageDialog(this, "Usuario o contraseña incorrectos.",
+                    "Acceso denegado", JOptionPane.WARNING_MESSAGE);
+        } catch (SQLException ex) {
+            mostrarError(ex);
+        }
+        return false;
+    }
+
+    private void cerrarSesionAdmin() {
+        adminAutenticado = false;
+        tabs.setSelectedIndex(0);
     }
 
     private void mostrarError(Exception ex) {
         JOptionPane.showMessageDialog(this, "Error: " + ex.getMessage(),
                 "Error", JOptionPane.ERROR_MESSAGE);
+    }
+
+    // Diálogo con la ruta del recibo y botones para abrirlo
+    private void mostrarRecibo(String mensaje, java.nio.file.Path ruta) {
+        mostrarArchivo("Recibo", mensaje, ruta, "Abrir recibo");
+    }
+
+    private void mostrarArchivo(String titulo, String mensaje, java.nio.file.Path ruta, String etiquetaAbrir) {
+        String[] opciones = {etiquetaAbrir, "Abrir carpeta", "Cerrar"};
+        int op = JOptionPane.showOptionDialog(this,
+                mensaje + "\n" + ruta.toAbsolutePath(),
+                titulo, JOptionPane.DEFAULT_OPTION, JOptionPane.INFORMATION_MESSAGE,
+                null, opciones, opciones[0]);
+        try {
+            if (op == 0) abrirArchivo(ruta.toAbsolutePath().toFile());
+            else if (op == 1) abrirArchivo(ruta.toAbsolutePath().getParent().toFile());
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, "No se pudo abrir:\n" + ex.getMessage(),
+                    "Error", JOptionPane.WARNING_MESSAGE);
+        }
+    }
+
+    private void abrirArchivo(java.io.File f) throws java.io.IOException {
+        if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+            Desktop.getDesktop().open(f);
+        } else {
+            new ProcessBuilder("xdg-open", f.getAbsolutePath()).start();   // respaldo en Linux
+        }
     }
 
     private JPanel crearCajaNotif(String titulo, JTextArea area) {
